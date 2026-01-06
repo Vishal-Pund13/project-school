@@ -30,6 +30,8 @@ async def lifespan(app: FastAPI):
         await db.projects.create_index("name")
         await db.projects.create_index("status")
         await db.tasks.create_index("project_id")
+        await db.chats.create_index("timestamp")
+        await db.chats.create_index([("userId", 1), ("timestamp", 1)])
         print("Indexes created")
     except Exception as e:
         print(f"Error: {e}")
@@ -102,6 +104,21 @@ class TaskUpdate(BaseModel):
     assigned_to: Optional[str] = None
     due_date: Optional[datetime] = None
 
+
+class ChatUpdate(BaseModel):
+    message: Optional[str] = None
+    model_config = ConfigDict(
+        populate_by_name=True,
+        json_encoders={ObjectId: str}
+    )
+
+    id: Optional[str] = Field(default=None)
+    userId: str = Field(..., min_length=1)
+    userType: str = Field(..., pattern="^(user|agent)$")  # Restricts to user or agent
+    timestamp: datetime = Field(default_factory=datetime.now)
+
+
+
 def project_helper(project) -> dict:
     """Convert MongoDB project document to API response format"""
     return {
@@ -132,6 +149,14 @@ def task_helper(task) -> dict:
         "updated_at": task.get("updated_at")
     }
 
+def chat_helper(chat) -> dict:
+    return {
+        "id": str(chat["_id"]),
+        "userId": chat["userId"],
+        "userType": chat["userType"],
+        "message": chat["message"],
+        "timestamp": chat.get("timestamp")
+    }
 @app.get("/")
 async def root():
     return {"message": "Project API with MongoDB", "version": "2.0.0"}
@@ -253,6 +278,58 @@ async def get_project_stats(project_id: str):
         "completed": len([t for t in tasks if t.get("status") == "completed"]),
         "blocked": len([t for t in tasks if t.get("status") == "blocked"])
     }
+
+
+"""post method for chat to post messages in the chat"""
+@app.post("/chat", response_model=ChatUpdate, status_code=201)
+async def store_chat_message(chat: ChatUpdate):
+    chat_dict = chat.model_dump(by_alias=True, exclude={"id"})
+    # Ensure timestamp is set at the moment of insertion
+    chat_dict["timestamp"] = datetime.now()
+
+    result = await db.chats.insert_one(chat_dict)
+    created = await db.chats.find_one({"_id": result.inserted_id})
+    return chat_helper(created)
+
+
+"""get method for chat to get the chat based upon the user id"""
+@app.get("/chat/{user_id}", response_model=List[ChatUpdate])
+async def get_conversation_history(user_id: str):
+    chats = []
+    # Sort by timestamp so the conversation reads in order
+    cursor = db.chats.find({"userId": user_id}).sort("timestamp", 1)
+    async for chat in cursor:
+        chats.append(chat_helper(chat))
+
+    if not chats:
+        return []
+    return chats
+
+"""delete method for chat to delete the chat based upon the message id"""
+@app.delete("/chat/{message_id}", status_code=204)
+async def delete_chat_message(message_id: str):
+    if not ObjectId.is_valid(message_id):
+        raise HTTPException(status_code=400, detail="Invalid message ID")
+
+    result = await db.chats.delete_one({"_id": ObjectId(message_id)})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Message not found")
+
+
+"""put method for chat to update the chat based upon the message id"""
+@app.put("/chat/{message_id}", response_model=ChatUpdate)
+async def update_chat_message(message_id: str, update: ChatUpdate):
+    if not ObjectId.is_valid(message_id):
+        raise HTTPException(status_code=400, detail="Invalid message ID")
+
+    data = {k: v for k, v in update.model_dump(exclude_unset=True).items() if v is not None}
+    if data:
+        await db.chats.update_one({"_id": ObjectId(message_id)}, {"$set": data})
+
+    updated = await db.chats.find_one({"_id": ObjectId(message_id)})
+    if not updated:
+        raise HTTPException(status_code=404, detail="Message not found")
+    return chat_helper(updated)
 
 if __name__ == "__main__":
     import uvicorn
